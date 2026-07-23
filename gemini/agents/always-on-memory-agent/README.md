@@ -113,9 +113,14 @@ A: "Based on your memories, prioritize:
 
 ### 1. Install
 
+This sample lives inside the `generative-ai` repository. Use a sparse checkout to grab just this directory:
+
 ```bash
-git clone https://github.com/Shubhamsaboo/always-on-memory-agent.git
-cd always-on-memory-agent
+git clone --depth 1 --filter=blob:none --sparse \
+  https://github.com/GoogleCloudPlatform/generative-ai.git
+cd generative-ai
+git sparse-checkout set gemini/agents/always-on-memory-agent
+cd gemini/agents/always-on-memory-agent
 pip install -r requirements.txt
 ```
 
