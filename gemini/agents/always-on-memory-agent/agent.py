@@ -15,6 +15,7 @@ Query:
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import mimetypes
@@ -37,6 +38,10 @@ from google.genai import types
 
 MODEL = os.getenv("MODEL", "gemini-3.1-flash-lite")
 DB_PATH = os.getenv("MEMORY_DB", "memory.db")
+
+# Gemini inline request limit is ~20MB; larger files are skipped *before* being
+# read into memory so a single oversized drop can't OOM the always-on process.
+MAX_INLINE_MB = float(os.getenv("MAX_INLINE_MB", "20"))
 
 # Supported file types for multimodal ingestion
 TEXT_EXTENSIONS = {".txt", ".md", ".json", ".csv", ".log", ".xml", ".yaml", ".yml"}
@@ -104,8 +109,45 @@ def get_db() -> sqlite3.Connection:
             path TEXT PRIMARY KEY,
             processed_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS ingested_content (
+            content_hash TEXT PRIMARY KEY,
+            source TEXT NOT NULL DEFAULT '',
+            ingested_at TEXT NOT NULL
+        );
     """)
     return db
+
+
+# ─── Idempotency helpers ───────────────────────────────────────
+
+
+def content_hash(data: bytes) -> str:
+    """Stable SHA-256 of raw input bytes, used to skip re-ingesting duplicates."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def content_already_ingested(digest: str) -> bool:
+    """True if content with this hash has already been ingested."""
+    db = get_db()
+    row = db.execute(
+        "SELECT 1 FROM ingested_content WHERE content_hash = ?", (digest,)
+    ).fetchone()
+    db.close()
+    return row is not None
+
+
+def record_ingested_content(digest: str, source: str = "") -> None:
+    """Record a content hash so identical input is not ingested again.
+
+    Uses INSERT OR IGNORE so concurrent watcher/API ingests stay idempotent.
+    """
+    db = get_db()
+    db.execute(
+        "INSERT OR IGNORE INTO ingested_content (content_hash, source, ingested_at) VALUES (?, ?, ?)",
+        (digest, source, datetime.now(timezone.utc).isoformat()),
+    )
+    db.commit()
+    db.close()
 
 
 # ─── ADK Tools ─────────────────────────────────────────────────
@@ -218,7 +260,12 @@ def store_consolidation(
                 row = db.execute("SELECT connections FROM memories WHERE id = ?", (mid,)).fetchone()
                 if row:
                     existing = json.loads(row["connections"])
-                    existing.append({"linked_to": to_id if mid == from_id else from_id, "relationship": rel})
+                    new_link = {"linked_to": to_id if mid == from_id else from_id, "relationship": rel}
+                    # Skip if this exact connection already exists so repeated
+                    # consolidation runs stay idempotent instead of piling up dupes.
+                    if new_link in existing:
+                        continue
+                    existing.append(new_link)
                     db.execute("UPDATE memories SET connections = ? WHERE id = ?", (json.dumps(existing), mid))
     placeholders = ",".join("?" * len(source_ids))
     db.execute(f"UPDATE memories SET consolidated = 1 WHERE id IN ({placeholders})", source_ids)
@@ -287,6 +334,7 @@ def clear_all_memories(inbox_path: str | None = None) -> dict:
     db.execute("DELETE FROM memories")
     db.execute("DELETE FROM consolidations")
     db.execute("DELETE FROM processed_files")
+    db.execute("DELETE FROM ingested_content")
     db.commit()
     db.close()
 
@@ -437,8 +485,15 @@ class MemoryAgent:
         return response
 
     async def ingest(self, text: str, source: str = "") -> str:
+        # Idempotency: skip re-ingesting byte-identical text regardless of source.
+        digest = content_hash(text.encode("utf-8"))
+        if content_already_ingested(digest):
+            log.info(f"⏭️  Skipping duplicate text (source: {source or 'n/a'})")
+            return "Skipped: duplicate content already ingested"
         msg = f"Remember this information (source: {source}):\n\n{text}" if source else f"Remember this information:\n\n{text}"
-        return await self.run(msg)
+        result = await self.run(msg)
+        record_ingested_content(digest, source=source)
+        return result
 
     async def ingest_file(self, file_path: Path) -> str:
         """Ingest a media file (image, audio, video, PDF) via multimodal."""
@@ -449,13 +504,31 @@ class MemoryAgent:
             mime_type, _ = mimetypes.guess_type(str(file_path))
             mime_type = mime_type or "application/octet-stream"
 
-        file_bytes = file_path.read_bytes()
-        size_mb = len(file_bytes) / (1024 * 1024)
+        # Check size *before* reading the file into memory. A multi-GB drop
+        # would otherwise OOM the always-on process at read_bytes().
+        try:
+            size_mb = file_path.stat().st_size / (1024 * 1024)
+        except OSError as e:
+            log.error(f"⚠️  Cannot stat {file_path.name}: {e}")
+            return f"Skipped: cannot access file ({e})"
 
         # Gemini has a ~20MB inline limit; skip very large files
-        if size_mb > 20:
-            log.warning(f"⚠️  Skipping {file_path.name} ({size_mb:.1f}MB) — exceeds 20MB limit")
+        if size_mb > MAX_INLINE_MB:
+            log.warning(f"⚠️  Skipping {file_path.name} ({size_mb:.1f}MB) — exceeds {MAX_INLINE_MB:.0f}MB limit")
             return f"Skipped: file too large ({size_mb:.1f}MB)"
+
+        # Fail closed on unreadable/corrupt files instead of crashing the watcher.
+        try:
+            file_bytes = file_path.read_bytes()
+        except OSError as e:
+            log.error(f"⚠️  Cannot read {file_path.name}: {e}")
+            return f"Skipped: unreadable file ({e})"
+
+        # Idempotency: skip re-ingesting byte-identical media regardless of filename.
+        digest = content_hash(file_bytes)
+        if content_already_ingested(digest):
+            log.info(f"⏭️  Skipping duplicate media: {file_path.name}")
+            return "Skipped: duplicate content already ingested"
 
         prompt = (
             f"Remember this file (source: {file_path.name}, type: {mime_type}).\n\n"
@@ -463,7 +536,9 @@ class MemoryAgent:
             f"extract all meaningful information for memory storage."
         )
         log.info(f"🔮 Ingesting {mime_type.split('/')[0]}: {file_path.name} ({size_mb:.1f}MB)")
-        return await self.run_multimodal(prompt, file_bytes, mime_type)
+        result = await self.run_multimodal(prompt, file_bytes, mime_type)
+        record_ingested_content(digest, source=file_path.name)
+        return result
 
     async def consolidate(self) -> str:
         return await self.run("Consolidate unconsolidated memories. Find connections and patterns.")
@@ -498,11 +573,20 @@ async def watch_folder(agent: MemoryAgent, folder: Path, poll_interval: int = 5)
 
                 try:
                     if suffix in TEXT_EXTENSIONS:
-                        # Text-based files — read as string
-                        log.info(f"📄 New text file: {f.name}")
-                        text = f.read_text(encoding="utf-8", errors="replace")[:10000]
-                        if text.strip():
-                            await agent.ingest(text, source=f.name)
+                        # Text-based files — read as string. Guard size first so a
+                        # huge .log can't be slurped into memory before truncation.
+                        try:
+                            size_mb = f.stat().st_size / (1024 * 1024)
+                        except OSError as stat_err:
+                            log.error(f"⚠️  Cannot stat {f.name}: {stat_err}")
+                            size_mb = 0
+                        if size_mb > MAX_INLINE_MB:
+                            log.warning(f"⚠️  Skipping {f.name} ({size_mb:.1f}MB) — exceeds {MAX_INLINE_MB:.0f}MB limit")
+                        else:
+                            log.info(f"📄 New text file: {f.name}")
+                            text = f.read_text(encoding="utf-8", errors="replace")[:10000]
+                            if text.strip():
+                                await agent.ingest(text, source=f.name)
                     else:
                         # Media files — send as multimodal bytes
                         log.info(f"🖼️  New media file: {f.name}")
