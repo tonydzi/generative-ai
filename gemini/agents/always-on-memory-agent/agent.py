@@ -38,6 +38,10 @@ from google.genai import types
 MODEL = os.getenv("MODEL", "gemini-3.1-flash-lite")
 DB_PATH = os.getenv("MEMORY_DB", "memory.db")
 
+# Gemini inline request limit is ~20MB. Files above this are skipped *before*
+# being read into memory, so one oversized drop cannot OOM the process.
+MAX_INLINE_MB = 20
+
 # Supported file types for multimodal ingestion
 TEXT_EXTENSIONS = {".txt", ".md", ".json", ".csv", ".log", ".xml", ".yaml", ".yml"}
 MEDIA_EXTENSIONS = {
@@ -218,7 +222,16 @@ def store_consolidation(
                 row = db.execute("SELECT connections FROM memories WHERE id = ?", (mid,)).fetchone()
                 if row:
                     existing = json.loads(row["connections"])
-                    existing.append({"linked_to": to_id if mid == from_id else from_id, "relationship": rel})
+                    link = {"linked_to": to_id if mid == from_id else from_id, "relationship": rel}
+                    # Re-consolidating the same memories must not pile up duplicate links,
+                    # even when the model words the relationship differently this time.
+                    same = next((c for c in existing if c.get("linked_to") == link["linked_to"]), None)
+                    if same is not None:
+                        if same.get("relationship") == rel:
+                            continue
+                        same["relationship"] = rel  # keep the latest description, one link per pair
+                    else:
+                        existing.append(link)
                     db.execute("UPDATE memories SET connections = ? WHERE id = ?", (json.dumps(existing), mid))
     placeholders = ",".join("?" * len(source_ids))
     db.execute(f"UPDATE memories SET consolidated = 1 WHERE id IN ({placeholders})", source_ids)
@@ -449,13 +462,30 @@ class MemoryAgent:
             mime_type, _ = mimetypes.guess_type(str(file_path))
             mime_type = mime_type or "application/octet-stream"
 
-        file_bytes = file_path.read_bytes()
-        size_mb = len(file_bytes) / (1024 * 1024)
+        # Check the size *before* reading: read_bytes() on a multi-GB file would
+        # exhaust memory before the size guard below ever ran.
+        try:
+            size_mb = file_path.stat().st_size / (1024 * 1024)
+        except OSError as e:
+            log.error(f"⚠️  Cannot stat {file_path.name}: {e}")
+            return f"Skipped: cannot access file ({e})"
 
         # Gemini has a ~20MB inline limit; skip very large files
-        if size_mb > 20:
-            log.warning(f"⚠️  Skipping {file_path.name} ({size_mb:.1f}MB) — exceeds 20MB limit")
+        if size_mb > MAX_INLINE_MB:
+            log.warning(f"⚠️  Skipping {file_path.name} ({size_mb:.1f}MB) — exceeds {MAX_INLINE_MB}MB limit")
             return f"Skipped: file too large ({size_mb:.1f}MB)"
+
+        limit = int(MAX_INLINE_MB * 1024 * 1024)
+        try:
+            # Bounded read: the file may have grown after stat(), so never read past the limit.
+            with open(file_path, "rb") as fh:
+                file_bytes = fh.read(limit + 1)
+        except OSError as e:
+            log.error(f"⚠️  Cannot read {file_path.name}: {e}")
+            return f"Skipped: unreadable file ({e})"
+        if len(file_bytes) > limit:
+            log.warning(f"⚠️  Skipping {file_path.name} — grew past {MAX_INLINE_MB}MB while reading")
+            return "Skipped: file too large"
 
         prompt = (
             f"Remember this file (source: {file_path.name}, type: {mime_type}).\n\n"
@@ -500,7 +530,14 @@ async def watch_folder(agent: MemoryAgent, folder: Path, poll_interval: int = 5)
                     if suffix in TEXT_EXTENSIONS:
                         # Text-based files — read as string
                         log.info(f"📄 New text file: {f.name}")
-                        text = f.read_text(encoding="utf-8", errors="replace")[:10000]
+                        # Skip oversized text files outright instead of ingesting a prefix.
+                        if f.stat().st_size / (1024 * 1024) > MAX_INLINE_MB:
+                            log.warning(f"⚠️  Skipping {f.name} — exceeds {MAX_INLINE_MB}MB limit")
+                            text = ""
+                        else:
+                            # Only the first 10000 chars are used; UTF-8 needs at most 4 bytes each.
+                            with open(f, "rb") as fh:
+                                text = fh.read(40000).decode("utf-8", errors="replace")[:10000]
                         if text.strip():
                             await agent.ingest(text, source=f.name)
                     else:
